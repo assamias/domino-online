@@ -18,6 +18,8 @@ app.get('/health', (req, res) => {
   res.json({ status: 'OK', message: 'Servidor rodando com suporte a Ponta de 5!' });
 });
 
+const BOT_ID = 'BOT_CPU';
+
 interface Room {
   id: string;
   players: string[];
@@ -36,6 +38,35 @@ interface Room {
 
 const rooms: Map<string, Room> = new Map();
 
+// Fila do "Fila Online": quem está esperando um oponente aleatório (por modo de jogo)
+const queue: { socketId: string; gameMode: GameMode }[] = [];
+
+function newRoom(id: string, players: string[], gameMode: GameMode, opts: { isPrivate: boolean; isBotGame: boolean }): Room {
+  return {
+    id,
+    players,
+    isPrivate: opts.isPrivate,
+    isBotGame: opts.isBotGame,
+    gameMode,
+    scores: {},
+    boneyard: [],
+    hands: {},
+    boardLeft: null,
+    boardRight: null,
+    playedPieces: [],
+    currentTurn: 0,
+    passesCount: 0
+  };
+}
+
+const humansOf = (room: Room) => room.players.filter((p) => p !== BOT_ID);
+const opponentOf = (room: Room, playerId: string) => room.players.find((p) => p !== playerId) as string;
+
+function removeFromQueue(socketId: string) {
+  const i = queue.findIndex((q) => q.socketId === socketId);
+  if (i >= 0) queue.splice(i, 1);
+}
+
 function startGame(roomId: string) {
   const room = rooms.get(roomId);
   if (!room) return;
@@ -47,7 +78,7 @@ function startGame(roomId: string) {
   room.boneyard = boneyard;
   room.hands = {};
   room.scores = {};
-  
+
   room.players.forEach((playerId, index) => {
     room.hands[playerId] = hands[index];
     room.scores[playerId] = 0;
@@ -59,31 +90,77 @@ function startGame(roomId: string) {
   room.currentTurn = 0;
   room.passesCount = 0;
 
-  io.to(room.players[0]).emit('game_started', {
-    roomId: room.id,
-    playerIndex: 0,
-    hand: room.hands[room.players[0]],
-    boneyardCount: boneyard.length,
-    opponentId: room.players[1],
-    isBotGame: room.isBotGame,
-    gameMode: room.gameMode,
-    scores: room.scores
+  room.players.forEach((playerId, index) => {
+    if (playerId === BOT_ID) return;
+    io.to(playerId).emit('game_started', {
+      roomId: room.id,
+      playerIndex: index,
+      hand: room.hands[playerId],
+      boneyardCount: boneyard.length,
+      opponentId: opponentOf(room, playerId),
+      isBotGame: room.isBotGame,
+      gameMode: room.gameMode,
+      scores: room.scores,
+      currentTurnPlayerId: room.players[room.currentTurn]
+    });
   });
 
-  if (!room.isBotGame && room.players[1]) {
-    io.to(room.players[1]).emit('game_started', {
-      roomId: room.id,
-      playerIndex: 1,
-      hand: room.hands[room.players[1]],
-      boneyardCount: boneyard.length,
-      opponentId: room.players[0],
-      isBotGame: false,
-      gameMode: room.gameMode,
-      scores: room.scores
+  console.log(`[Game] Partida iniciada na sala ${room.id} - Modo: ${room.gameMode}`);
+}
+
+// Manda o estado atual para cada jogador humano. Cada um recebe a própria mão
+// (junto com o estado da mesa, para o cliente atualizar tudo de uma vez)
+// e a quantidade de peças do oponente.
+function broadcastUpdate(room: Room) {
+  const nextPlayerId = room.players[room.currentTurn];
+  for (const playerId of humansOf(room)) {
+    io.to(playerId).emit('game_updated', {
+      boardLeft: room.boardLeft,
+      boardRight: room.boardRight,
+      playedPieces: room.playedPieces,
+      boneyardCount: room.boneyard.length,
+      currentTurnPlayerId: nextPlayerId,
+      scores: room.scores,
+      hand: room.hands[playerId],
+      opponentHandCount: room.hands[opponentOf(room, playerId)]?.length ?? 0
     });
   }
+}
 
-  console.log(`[Game] Partida iniciada na sala ${room.id} - Modo: ${room.gameMode}`);
+// Fim de jogo: cada jogador recebe a mensagem do ponto de vista dele.
+function endGame(room: Room, winner: string, reasonFor: (playerId: string) => string) {
+  for (const playerId of humansOf(room)) {
+    io.to(playerId).emit('game_over', { winner, reason: reasonFor(playerId), scores: room.scores });
+  }
+  rooms.delete(room.id);
+}
+
+function endGameByEmptyHand(room: Room, winnerId: string) {
+  endGame(room, winnerId, (pid) => {
+    if (pid === winnerId) return 'Você bateu e venceu!';
+    return room.isBotGame ? 'A CPU bateu e venceu!' : 'O oponente bateu e venceu!';
+  });
+}
+
+function checkBlockedGameWinner(room: Room) {
+  const p1 = room.players[0];
+  const p2 = room.players[1];
+  const p1Points = DominoEngine.calculateHandPoints(room.hands[p1] || []);
+  const p2Points = DominoEngine.calculateHandPoints(room.hands[p2] || []);
+
+  let winner = 'DRAW';
+  if (p1Points < p2Points) winner = p1;
+  else if (p2Points < p1Points) winner = p2;
+
+  const pointsOf = (pid: string) => (pid === p1 ? p1Points : p2Points);
+
+  endGame(room, winner, (pid) => {
+    const mine = pointsOf(pid);
+    const theirs = pointsOf(opponentOf(room, pid));
+    let text = `Jogo trancado! Você: ${mine} pts na mão vs ${room.isBotGame ? 'CPU' : 'Oponente'}: ${theirs}.`;
+    if (winner !== 'DRAW') text += ' Vitória por menor soma de peças!';
+    return text;
+  });
 }
 
 function handleBotTurn(roomId: string) {
@@ -92,9 +169,9 @@ function handleBotTurn(roomId: string) {
 
   setTimeout(() => {
     const currentRoom = rooms.get(roomId);
-    if (!currentRoom || currentRoom.players[currentRoom.currentTurn] !== 'BOT_CPU') return;
+    if (!currentRoom || currentRoom.players[currentRoom.currentTurn] !== BOT_ID) return;
 
-    const botHand = currentRoom.hands['BOT_CPU'] || [];
+    const botHand = currentRoom.hands[BOT_ID] || [];
     let botMove = DominoEngine.findBotMove(botHand, currentRoom.boardLeft, currentRoom.boardRight);
 
     while (!botMove && currentRoom.boneyard.length > 0) {
@@ -117,10 +194,9 @@ function handleBotTurn(roomId: string) {
         currentRoom.boardLeft = validation.newBoardLeft!;
         currentRoom.boardRight = validation.newBoardRight!;
         currentRoom.playedPieces.push({ piece: validation.rotatedPiece, side: botMove.side });
-        currentRoom.hands['BOT_CPU'] = botHand.filter(p => p.id !== botMove!.piece.id);
+        currentRoom.hands[BOT_ID] = botHand.filter((p) => p.id !== botMove!.piece.id);
         currentRoom.passesCount = 0;
 
-        // Se for Ponta de 5, verifica se a CPU pontuou
         if (currentRoom.gameMode === 'PONTA_DE_CINCO') {
           const pointsScored = DominoEngine.calculatePontaDeCincoPoints(
             currentRoom.playedPieces,
@@ -128,17 +204,13 @@ function handleBotTurn(roomId: string) {
             currentRoom.boardRight
           );
           if (pointsScored > 0) {
-            currentRoom.scores['BOT_CPU'] = (currentRoom.scores['BOT_CPU'] || 0) + pointsScored;
+            currentRoom.scores[BOT_ID] = (currentRoom.scores[BOT_ID] || 0) + pointsScored;
           }
         }
 
-        if (currentRoom.hands['BOT_CPU'].length === 0) {
-          io.to(currentRoom.id).emit('game_over', {
-            winner: 'BOT_CPU',
-            reason: 'A CPU bateu e venceu!',
-            scores: currentRoom.scores
-          });
-          rooms.delete(roomId);
+        if (currentRoom.hands[BOT_ID].length === 0) {
+          broadcastUpdate(currentRoom); // mostra a última peça na mesa antes do fim
+          endGameByEmptyHand(currentRoom, BOT_ID);
           return;
         }
       }
@@ -151,104 +223,113 @@ function handleBotTurn(roomId: string) {
     }
 
     currentRoom.currentTurn = 0;
-
-    io.to(currentRoom.id).emit('game_updated', {
-      boardLeft: currentRoom.boardLeft,
-      boardRight: currentRoom.boardRight,
-      playedPieces: currentRoom.playedPieces,
-      boneyardCount: currentRoom.boneyard.length,
-      currentTurnPlayerId: currentRoom.players[0],
-      opponentHandCount: currentRoom.hands['BOT_CPU'].length,
-      scores: currentRoom.scores
-    });
+    broadcastUpdate(currentRoom);
   }, 1200);
 }
 
-function checkBlockedGameWinner(room: Room) {
-  const p1Hand = room.hands[room.players[0]] || [];
-  const p2Hand = room.hands[room.players[1]] || [];
-
-  const p1Points = DominoEngine.calculateHandPoints(p1Hand);
-  const p2Points = DominoEngine.calculateHandPoints(p2Hand);
-
-  let winner = 'DRAW';
-  let reason = `Jogo trancado! P1: ${p1Points} pts em mão vs P2: ${p2Points} pts em mão.`;
-
-  if (p1Points < p2Points) {
-    winner = room.players[0];
-    reason += ` Vitória por menor soma de peças!`;
-  } else if (p2Points < p1Points) {
-    winner = room.players[1];
-    reason += ` Vitória por menor soma de peças!`;
+// Valida "é a vez de quem pediu?" e devolve a sala; responde com erro e devolve null se não for.
+function getRoomForTurn(socketId: string, roomId: string): Room | null {
+  const room = rooms.get(roomId);
+  if (!room || !room.players.includes(socketId)) return null;
+  if (room.players[room.currentTurn] !== socketId) {
+    io.to(socketId).emit('error_message', { message: 'Não é a sua vez!' });
+    return null;
   }
+  return room;
+}
 
-  io.to(room.id).emit('game_over', { winner, reason, scores: room.scores });
-  rooms.delete(room.id);
+function passTurnTo(room: Room) {
+  room.currentTurn = room.currentTurn === 0 ? 1 : 0;
+  broadcastUpdate(room);
+  if (room.isBotGame && room.players[room.currentTurn] === BOT_ID) {
+    handleBotTurn(room.id);
+  }
 }
 
 io.on('connection', (socket) => {
   console.log(`[Socket] Conectado: ${socket.id}`);
 
-// 1. Criar Sala Privada
-socket.on('create_private_room', (data?: { gameMode?: GameMode }) => {
-  const gameMode = data?.gameMode || 'CLASSIC';
-  const roomCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-  const room: Room = {
-    id: roomCode,
-    players: [socket.id],
-    isPrivate: true,
-    isBotGame: false,
-    gameMode,
-    scores: {},
-    boneyard: [],
-    hands: {},
-    boardLeft: null,
-    boardRight: null,
-    playedPieces: [],
-    currentTurn: 0,
-    passesCount: 0
-  };
+  // 1. Criar Sala Privada
+  socket.on('create_private_room', (data?: { gameMode?: GameMode }) => {
+    removeFromQueue(socket.id);
+    const gameMode = data?.gameMode || 'CLASSIC';
+    const roomCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+    const room = newRoom(roomCode, [socket.id], gameMode, { isPrivate: true, isBotGame: false });
 
-  rooms.set(roomCode, room);
-  socket.join(roomCode);
-  socket.emit('private_room_created', { roomCode, gameMode });
-});
+    rooms.set(roomCode, room);
+    socket.join(roomCode);
+    socket.emit('private_room_created', { roomCode, gameMode });
+  });
 
-// 2. Modo CPU (Bot)
-socket.on('start_bot_game', (data?: { gameMode?: GameMode }) => {
-  const gameMode = data?.gameMode || 'CLASSIC';
-  const roomId = `bot_${Date.now()}`;
-  const room: Room = {
-    id: roomId,
-    players: [socket.id, 'BOT_CPU'],
-    isPrivate: false,
-    isBotGame: true,
-    gameMode,
-    scores: {},
-    boneyard: [],
-    hands: {},
-    boardLeft: null,
-    boardRight: null,
-    playedPieces: [],
-    currentTurn: 0,
-    passesCount: 0
-  };
+  // 1b. Entrar numa sala privada pelo código
+  socket.on('join_private_room', (data?: { roomCode?: string }) => {
+    const code = (data?.roomCode || '').trim().toUpperCase();
+    const room = rooms.get(code);
 
-  rooms.set(roomId, room);
-  socket.join(roomId);
-  startGame(roomId);
-});
+    if (!room || !room.isPrivate || room.players.length !== 1 || room.players[0] === socket.id) {
+      return socket.emit('error_message', { message: 'Sala não encontrada ou já cheia.' });
+    }
+
+    removeFromQueue(socket.id);
+    room.players.push(socket.id);
+    socket.join(room.id);
+    startGame(room.id);
+  });
+
+  // 2. Modo CPU (Bot)
+  socket.on('start_bot_game', (data?: { gameMode?: GameMode }) => {
+    removeFromQueue(socket.id);
+    const gameMode = data?.gameMode || 'CLASSIC';
+    const roomId = `bot_${Date.now()}`;
+    const room = newRoom(roomId, [socket.id, BOT_ID], gameMode, { isPrivate: false, isBotGame: true });
+
+    rooms.set(roomId, room);
+    socket.join(roomId);
+    startGame(roomId);
+  });
+
+  // 3. Fila online (oponente aleatório)
+  socket.on('join_random_game', (data?: { gameMode?: GameMode }) => {
+    const gameMode = data?.gameMode || 'CLASSIC';
+    removeFromQueue(socket.id);
+
+    const waiting = queue.find((q) => q.gameMode === gameMode && q.socketId !== socket.id);
+    if (!waiting) {
+      queue.push({ socketId: socket.id, gameMode });
+      return socket.emit('waiting_for_opponent', { gameMode });
+    }
+
+    removeFromQueue(waiting.socketId);
+    const roomId = `rnd_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    const room = newRoom(roomId, [waiting.socketId, socket.id], gameMode, { isPrivate: false, isBotGame: false });
+    rooms.set(roomId, room);
+    io.sockets.sockets.get(waiting.socketId)?.join(roomId);
+    socket.join(roomId);
+    startGame(roomId);
+  });
+
+  // Cancelar a espera (fila ou sala privada que ainda não começou)
+  socket.on('cancel_waiting', () => {
+    removeFromQueue(socket.id);
+    for (const [roomId, room] of rooms.entries()) {
+      if (room.isPrivate && room.players.length === 1 && room.players[0] === socket.id) {
+        rooms.delete(roomId);
+      }
+    }
+  });
 
   // Jogar Peça na Mesa
   socket.on('play_piece', ({ roomId, piece, side }: { roomId: string; piece: Piece; side: 'left' | 'right' }) => {
-    const room = rooms.get(roomId);
+    const room = getRoomForTurn(socket.id, roomId);
     if (!room) return;
 
-    if (room.players[room.currentTurn] !== socket.id) {
-      return socket.emit('error_message', { message: 'Não é a sua vez!' });
+    // Usa a peça que está de fato na mão do jogador (o cliente não é confiável)
+    const owned = (room.hands[socket.id] || []).find((p) => p.id === piece?.id);
+    if (!owned) {
+      return socket.emit('error_message', { message: 'Você não tem essa peça!' });
     }
 
-    const validation = DominoEngine.validateMove(piece, side, room.boardLeft, room.boardRight);
+    const validation = DominoEngine.validateMove(owned, side, room.boardLeft, room.boardRight);
     if (!validation.valid || !validation.rotatedPiece) {
       return socket.emit('error_message', { message: 'Jogada inválida!' });
     }
@@ -256,7 +337,7 @@ socket.on('start_bot_game', (data?: { gameMode?: GameMode }) => {
     room.boardLeft = validation.newBoardLeft!;
     room.boardRight = validation.newBoardRight!;
     room.playedPieces.push({ piece: validation.rotatedPiece, side });
-    room.hands[socket.id] = room.hands[socket.id].filter(p => p.id !== piece.id);
+    room.hands[socket.id] = room.hands[socket.id].filter((p) => p.id !== owned.id);
     room.passesCount = 0;
 
     // Cálculo da Regra Ponta de 5
@@ -273,33 +354,61 @@ socket.on('start_bot_game', (data?: { gameMode?: GameMode }) => {
     }
 
     if (room.hands[socket.id].length === 0) {
-      io.to(room.id).emit('game_over', { winner: socket.id, reason: 'Você bateu e venceu!', scores: room.scores });
-      rooms.delete(roomId);
+      broadcastUpdate(room); // mostra a última peça na mesa antes do fim
+      endGameByEmptyHand(room, socket.id);
       return;
     }
 
-    room.currentTurn = room.currentTurn === 0 ? 1 : 0;
-    const nextPlayerId = room.players[room.currentTurn];
+    passTurnTo(room);
+  });
 
-    io.to(room.id).emit('game_updated', {
-      boardLeft: room.boardLeft,
-      boardRight: room.boardRight,
-      playedPieces: room.playedPieces,
-      boneyardCount: room.boneyard.length,
-      currentTurnPlayerId: nextPlayerId,
-      scores: room.scores
-    });
+  // Comprar do dorme: só é permitido sem nenhuma jogada possível. A vez continua sua.
+  socket.on('draw_piece', ({ roomId }: { roomId: string }) => {
+    const room = getRoomForTurn(socket.id, roomId);
+    if (!room) return;
 
-    socket.emit('your_hand_updated', { hand: room.hands[socket.id] });
-
-    if (room.isBotGame && nextPlayerId === 'BOT_CPU') {
-      handleBotTurn(roomId);
+    const hand = room.hands[socket.id] || [];
+    if (DominoEngine.getValidMoves(hand, room.boardLeft, room.boardRight).length > 0) {
+      return socket.emit('error_message', { message: 'Você tem peça para jogar!' });
     }
+
+    const drawn = room.boneyard.pop();
+    if (!drawn) {
+      return socket.emit('error_message', { message: 'O dorme está vazio. Passe a vez.' });
+    }
+
+    hand.push(drawn);
+    room.hands[socket.id] = hand;
+    broadcastUpdate(room);
+  });
+
+  // Passar a vez: só é permitido sem jogada possível E com o dorme vazio.
+  socket.on('pass_turn', ({ roomId }: { roomId: string }) => {
+    const room = getRoomForTurn(socket.id, roomId);
+    if (!room) return;
+
+    const hand = room.hands[socket.id] || [];
+    if (DominoEngine.getValidMoves(hand, room.boardLeft, room.boardRight).length > 0) {
+      return socket.emit('error_message', { message: 'Você tem peça para jogar!' });
+    }
+    if (room.boneyard.length > 0) {
+      return socket.emit('error_message', { message: 'Ainda há peças no dorme: compre uma.' });
+    }
+
+    room.passesCount++;
+    if (room.passesCount >= 2) {
+      return checkBlockedGameWinner(room);
+    }
+    passTurnTo(room);
   });
 
   socket.on('disconnect', () => {
+    removeFromQueue(socket.id);
     for (const [roomId, room] of rooms.entries()) {
       if (room.players.includes(socket.id)) {
+        for (const other of humansOf(room)) {
+          if (other !== socket.id) io.to(other).emit('opponent_left', { reason: 'O oponente saiu da partida.' });
+        }
         rooms.delete(roomId);
         break;
       }
